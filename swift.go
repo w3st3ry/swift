@@ -1811,6 +1811,32 @@ func (c *Connection) ObjectCopy(srcContainer string, srcObjectName string, dstCo
 	return
 }
 
+// ManifestCopy does a server side copy of a manifest to a new position.
+//
+// Source object segments are kept untouched and the path to these segments
+// is preserved between copies.
+//
+// The destination container must exist before the copy.
+func (c *Connection) ManifestCopy(srcContainer string, srcManifestName string, dstContainer string, dstManifestName string, h Headers) (headers Headers, err error) {
+	// Meta stuff
+	extraHeaders := map[string]string{
+		"Destination": dstContainer + "/" + dstManifestName,
+	}
+	for key, value := range h {
+		extraHeaders[key] = value
+	}
+	_, headers, err = c.storage(RequestOpts{
+		Container:  srcContainer,
+		ObjectName: srcManifestName,
+		Operation:  "COPY",
+		ErrorMap:   objectErrorMap,
+		NoResponse: true,
+		Parameters: map[string][]string{"multipart-manifest": []string{"get"}},
+		Headers:    extraHeaders,
+	})
+	return
+}
+
 // ObjectMove does a server side move of an object to a new position
 //
 // This is a convenience method which calls ObjectCopy then ObjectDelete
