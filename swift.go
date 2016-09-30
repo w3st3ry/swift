@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/juju/ratelimit"
 )
 
 var (
@@ -151,6 +153,7 @@ var (
 	TimeoutError        = newError(408, "Timeout when reading or writing data")
 	Forbidden           = newError(403, "Operation forbidden")
 	TooLargeObject      = newError(413, "Too Large Object")
+	TooManyRequests     = newError(429, "Too Many Requests")
 
 	// Mappings for authentication errors
 	authErrorMap = errorMap{
@@ -174,6 +177,7 @@ var (
 		404: ObjectNotFound,
 		413: TooLargeObject,
 		422: ObjectCorrupted,
+		429: TooManyRequests,
 	}
 )
 
@@ -1090,19 +1094,38 @@ func (c *Connection) ContainerUpdate(container string, h Headers) error {
 
 // ObjectCreateFile represents a swift object open for writing
 type ObjectCreateFile struct {
-	checkHash  bool           // whether we are checking the hash
-	pipeReader *io.PipeReader // pipe for the caller to use
-	pipeWriter *io.PipeWriter
-	hash       hash.Hash      // hash being build up as we go along
-	done       chan struct{}  // signals when the upload has finished
-	resp       *http.Response // valid when done has signalled
-	err        error          // ditto
-	headers    Headers        // ditto
+	checkHash    bool           // whether we are checking the hash
+	pipeReader   *io.PipeReader // pipe for the caller to use
+	pipeWriter   io.Writer
+	hash         hash.Hash      // hash being build up as we go along
+	done         chan struct{}  // signals when the upload has finished
+	resp         *http.Response // valid when done has signalled
+	err          error          // ditto
+	headers      Headers        // ditto
+	fillInterval time.Duration  // fillInterval of bucket in seconds
+	capacity     int64          // capacity per bucket in bits
+	quantum      int64          // quantum specification, based on capacity
 }
 
-// Write bytes to the object - see io.Writer
+// Set ratelimit values in struct
+func (file *ObjectCreateFile) ActiveRatelimit(fillInterval time.Duration, capacity uint64) {
+	file.fillInterval = fillInterval
+	// Represents the conversion factor
+	file.capacity = int64(capacity) * 160
+	file.quantum = file.capacity - (file.capacity / 8)
+}
+
+// Write bytes to the object using a bucket if ratelimit is set
+// See io.Writer and https://en.wikipedia.org/wiki/Token_bucket
 func (file *ObjectCreateFile) Write(p []byte) (n int, err error) {
-	n, err = file.pipeWriter.Write(p)
+	if file.capacity == 0 {
+		n, err = file.pipeWriter.Write(p)
+	} else if file.capacity > 0 {
+		bucket := ratelimit.NewBucketWithQuantum(time.Millisecond*file.fillInterval, file.capacity, file.quantum)
+		n, err = ratelimit.Writer(file.pipeWriter, bucket).Write(p)
+	} else {
+		return 0, newError(500, "Ratelimit bandwidth must be > 0")
+	}
 	if err == io.ErrClosedPipe {
 		if file.err != nil {
 			return 0, file.err
@@ -1121,7 +1144,7 @@ func (file *ObjectCreateFile) Write(p []byte) (n int, err error) {
 // found) so it is very important to check the errors on this method.
 func (file *ObjectCreateFile) Close() error {
 	// Close the body
-	err := file.pipeWriter.Close()
+	err := file.pipeWriter.(*io.PipeWriter).Close()
 	if err != nil {
 		return err
 	}
@@ -1309,7 +1332,9 @@ type ObjectOpenFile struct {
 
 // Read bytes from the object - see io.Reader
 func (file *ObjectOpenFile) Read(p []byte) (n int, err error) {
+	bucket := ratelimit.NewBucket(10, 10)
 	n, err = file.body.Read(p)
+	file.body = ratelimit.Reader(file.body, bucket)
 	file.bytes += int64(n)
 	file.pos += int64(n)
 	if err == io.EOF {
